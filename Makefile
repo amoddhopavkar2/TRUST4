@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS= -O3 -Wall -g #-pg -g #-Wall #-O3
+CXXFLAGS=-w
 LINKPATH= -I./samtools-0.1.19 -L./samtools-0.1.19
 LINKFLAGS = -lpthread -lz 
 DEBUG=
