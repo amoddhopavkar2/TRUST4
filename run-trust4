@@ -1,0 +1,536 @@
+#!/usr/bin/env perl
+
+use strict ;
+use warnings ;
+
+use Cwd 'cwd' ;
+use Cwd 'abs_path' ;
+use File::Basename ;
+
+die "TRUST4 v1.0.12-r465 usage: ./run-trust4 [OPTIONS]:\n".
+    "Required:\n".
+    #"\t[Input]:\n".
+    "\t-b STRING: path to bam file\n".
+    "\t-1 STRING -2 STRING: path to paired-end read files\n".
+    "\t-u STRING: path to single-end read file\n".
+    "\t-f STRING: path to the fasta file coordinate and sequence of V/D/J/C genes\n".
+    "Optional:\n".
+    "\t--ref STRING: path to detailed V/D/J/C gene reference file from IMGT database. (default: not used but recommended)\n".
+    "\t-o STRING: prefix of output files. (default: inferred from file prefix)\n".
+    "\t--od STRING: the directory for output files. (default: ./)\n".
+    "\t-t INT: number of threads (default: 1)\n".
+		"\t-k INT: the starting k-mer size for indexing contigs (default: 9)\n".
+    #"\t-h: print help message and exit.\n"
+    "\t--barcode STRING: if -b, bam field for barcode; if -1 -2/-u, file containing barcodes (default: not used)\n".
+		#"\t--barcodeRange INT INT CHAR: start, end(-1 for length-1), strand in a barcode is the true barcode (default: 0 -1 +)\n".
+    "\t--barcodeWhitelist STRING: path to the barcode whitelist (default: not used)\n".
+		"\t--barcodeTranslate STRING: path to the barcode translate file (default: not used)\n".
+		#"\t--read1Range INT INT: start, end(-1 for length-1) in -1/-u files for genomic sequence (default: 0 -1)\n".
+		#"\t--read2Range INT INT: start, end(-1 for length-1) in -2 files for genomic sequence (default: 0 -1)\n".
+		"\t--UMI STRING: if -b, bam field for UMI; if -1 -2/-u, file containing UMIs (default: not used)\n".
+		#"\t--umiRange INT INT CHAR: start, end(-1 for lenght-1), strand in a UMI is the true UMI (default: 0 -1 +)\n".
+		"\t--readFormat STRING: format for read, barcode and UMI files (example: r1:0:-1,r2:0:-1,bc:0:15,um:16:-1 for paired-end files with barcode and UMI)\n".
+    "\t--repseq: the data is from TCR-seq or BCR-seq (default: not set)\n".
+		"\t--barcodeLevel STRING: barcode is for cell or molecule (default: cell)\n".
+		"\t--minHitLen INT: the minimal hit length for a valid overlap (default: auto)\n".
+    "\t--mateIdSuffixLen INT: the suffix length in read id for mate. (default: not used)\n".
+    "\t--skipMateExtension: do not extend assemblies with mate information, useful for SMART-seq (default: not used)\n".
+    "\t--abnormalUnmapFlag: the flag in BAM for the unmapped read-pair is nonconcordant (default: not set)\n".
+    "\t--noExtraction: directly use the files from provided -1 -2/-u to assemble (default: extraction first)\n".
+    "\t--assembleWithRef: conduct the assembly with --ref file (default: use -f file)\n".
+		"\t--outputReadAssignment: output read assignment results to the prefix_assign.out file (default: no output)\n".
+    "\t--stage INT: start TRUST4 on specified stage (default: 0):\n".
+    "\t\t0: start from beginning (candidate read extraction)\n".
+    "\t\t1: start from assembly\n".
+    "\t\t2: start from annotation\n".
+    "\t\t3: start from generating the report table\n".
+    #"\t--jellyfish: use jellyfish2 to count the kmers. (default: not used)\n"
+    "" 
+	if ( @ARGV == 0 ) ;
+
+sub system_call
+{
+	print STDERR "[".localtime()."] SYSTEM CALL: ".join(" ",@_)."\n";
+	system(@_) == 0
+		or die "system @_ failed: $?";
+	#print STDERR " finished\n";
+} 
+
+my $WD = dirname( abs_path( $0 ) ) ;
+my $kmerSize = 21 ;
+my $bloomFilterSize = 100000000 ;
+my $i ;
+my $j ;
+
+my $jellyfishBin = "jellyfish" ;
+#if ( -e "$WD/jellyfish/bin/jellyfish" )
+#{
+#	$jellyfishBin = "$WD/jellyfish/bin/jellyfish" ;
+#}
+
+# process the options.
+my @singleFiles ;
+my @firstMateFiles ;
+my @secondMateFiles ;
+my @bamFiles ;
+my @barcodeFiles ;
+my @umiFiles ;
+my $useJellyfish = 0 ;
+my $prefix = "" ;
+my $vdjcFasta = "" ;
+my $vdjcRef = "" ;
+my $bamExtractorArgs = "" ;
+my $fastqExtractorArgs = "" ;
+my $mainArgs = "" ;
+my $annotatorArgs = "" ;
+my $simpleRepArgs = "" ;
+my $threadCnt = 1 ;
+my $stage = 0 ;
+my $noExtraction = 0 ;
+my $hasBarcode = 0 ;
+my $hasUmi = 0 ;
+my $outputDirectory = "" ;
+my $outputReadAssignment = 0 ;
+my $chainsInBarcode = 2 ;
+my $assembleWithRef = 0 ;
+
+print STDERR "[".localtime()."] TRUST4 begins.\n" ;
+for ( $i = 0 ; $i < @ARGV ; ++$i )
+{
+	if ( $ARGV[$i] eq "-1" )
+	{
+		for ($j = $i + 1; $j < @ARGV; ++$j )		
+		{
+			last if ($ARGV[$j] =~ /^-/) ;
+			push @firstMateFiles, glob($ARGV[$j]) ;
+		}
+		$i = $j - 1 ;
+	}
+	elsif ( $ARGV[$i] eq "-2" )
+	{	
+		for ($j = $i + 1; $j < @ARGV; ++$j )		
+		{
+			last if ($ARGV[$j] =~ /^-/) ;
+			push @secondMateFiles, glob($ARGV[$j]) ;
+		}
+		$i = $j - 1 ;
+	}
+	elsif ( $ARGV[ $i ] eq "-u" ) 
+	{
+		for ($j = $i + 1; $j < @ARGV; ++$j )		
+		{
+			last if ($ARGV[$j] =~ /^-/) ;
+			push @singleFiles, glob($ARGV[$j]) ;
+		}
+		$i = $j - 1 ;
+	}
+	elsif ( $ARGV[$i] eq "-b" )
+	{
+		push @bamFiles, $ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "-f" )
+	{	
+		$vdjcFasta = $ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "-o" )
+	{
+		$prefix = $ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "--od" )
+	{
+		$outputDirectory = $ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "--ref" )
+	{
+		$vdjcRef = $ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "-t" )
+	{
+		$threadCnt = $ARGV[$i + 1] ;
+		$mainArgs .= " ".$ARGV[$i]." ".$ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "-k" )
+	{
+		$mainArgs .= " ".$ARGV[$i]." ".$ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "--abnormalUnmapFlag" )
+	{
+		$bamExtractorArgs .= " -u" ;
+	}
+	elsif ( $ARGV[$i] eq "--jellyfish" )
+	{
+		$useJellyfish = 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--mateIdSuffixLen" )
+	{
+		$bamExtractorArgs .= "--mateIdSuffixLen ".$ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "--skipMateExtension" )
+	{
+		$mainArgs .= " ".$ARGV[$i] ;
+	}
+	elsif ( $ARGV[$i] eq "--noExtraction" )
+	{
+		$noExtraction = 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--barcode" )
+	{
+		$hasBarcode = 1 ;
+		$bamExtractorArgs .= " --barcode ".$ARGV[$i + 1] ;
+		#$fastqExtractorArgs .= " --barcode ".$ARGV[$i + 1] ;
+		for ($j = $i + 1; $j < @ARGV; ++$j )		
+		{
+			last if ($ARGV[$j] =~ /^-/) ;
+			push @barcodeFiles, glob($ARGV[$j]) ;
+		}
+		$simpleRepArgs .= " --barcodeCnt" ;
+		$annotatorArgs .= "--barcode" ;
+		$i = $j - 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--barcodeRange" )
+	{
+		$fastqExtractorArgs .= " --barcodeStart ".$ARGV[$i + 1]." --barcodeEnd ".$ARGV[$i + 2] ;
+		if ( $ARGV[$i + 3] eq "-" ) 
+		{
+			$fastqExtractorArgs .= " --barcodeRevComp" ;
+		}
+
+		$i += 3 ;
+	}
+	elsif ( $ARGV[$i] eq "--read1Range")
+	{
+		$fastqExtractorArgs .= " --read1Start ".$ARGV[$i + 1]." --read1End ".$ARGV[$i + 2] ;
+		$i += 2 ;
+	}
+	elsif ( $ARGV[$i] eq "--read2Range")
+	{
+		$fastqExtractorArgs .= " --read2Start ".$ARGV[$i + 1]." --read2End ".$ARGV[$i + 2] ;
+		$i += 2 ;
+	}
+	elsif ( $ARGV[$i] eq "--barcodeWhitelist" )
+	{
+		$fastqExtractorArgs .= " --barcodeWhitelist ".$ARGV[$i + 1] ;
+		$i += 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--barcodeTranslate" )
+	{
+		$fastqExtractorArgs .= " --barcodeTranslate ".$ARGV[$i + 1] ;
+		$i += 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--UMI" )
+	{
+		$hasUmi = 1 ;
+		$bamExtractorArgs .= " --UMI ".$ARGV[$i + 1] ;
+		for ($j = $i + 1; $j < @ARGV; ++$j )		
+		{
+			last if ($ARGV[$j] =~ /^-/) ;
+			push @umiFiles, glob($ARGV[$j]) ;
+		}
+		$annotatorArgs .= " --UMI" ;
+		$i = $j - 1;
+	}
+	elsif ( $ARGV[$i] eq "--umiRange")
+	{
+		$fastqExtractorArgs .= " --umiStart ".$ARGV[$i + 1]." --umiEnd ".$ARGV[$i + 2] ;
+		if ( $ARGV[$i + 3] eq "-" ) 
+		{
+			$fastqExtractorArgs .= " --umiRevComp" ;
+		}
+
+		$i += 3 ;
+	}
+	elsif ( $ARGV[$i] eq "--readFormat")
+	{
+		$fastqExtractorArgs .= " --readFormat ".$ARGV[$i + 1] ;
+		$i += 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--minHitLen" )
+	{
+		$mainArgs .= " ".$ARGV[$i]." ".$ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "--outputReadAssignment" )
+	{
+		$outputReadAssignment = 1 ;
+	}
+	elsif ( $ARGV[$i] eq "--stage" )
+	{
+		$stage = $ARGV[$i + 1] ;
+		++$i ;
+	}
+	elsif ( $ARGV[$i] eq "--repseq" )
+	{
+		$mainArgs .= " --trimLevel 2 --skipMateExtension" ;
+	}
+	elsif ($ARGV[$i] eq "--barcode-level" || $ARGV[$i] eq "--barcodeLevel")
+	{
+		$chainsInBarcode = 1 if ($ARGV[$i + 1] eq "molecule") ;
+		++$i ;
+	}
+	elsif ($ARGV[$i] eq "--assembleWithRef")
+	{
+		$assembleWithRef = 1 ;
+	}
+	else
+	{
+		die "Unknown parameter ".$ARGV[$i]."\n" ;
+	}
+}
+
+if ( @bamFiles == 0 && @firstMateFiles == 0 && @singleFiles == 0 )
+{
+	die "Need to use -b/{-1,-2}/-u to specify input reads.\n" ;
+}
+
+if ( @bamFiles > 0 && $noExtraction == 1 )
+{
+	die "--noExtraction option can only be set when using -1 -2/-u as input.\n" ;
+}
+
+if ( $vdjcFasta eq "" )
+{
+	die "Need to use -f to specify the sequence of annotated V/D/J/C genes' sequence.\n" ;
+}
+
+if ( $assembleWithRef == 1 )
+{
+	die "Need to use --ref to specify the comprehensive V/D/J/C reference file when using --assembleWithRef option.\n" if ($vdjcRef eq "") ;
+	$mainArgs .= " -f $vdjcRef" ;
+}
+else
+{
+	$mainArgs .= " -f $vdjcFasta" ;
+}
+
+# Check the existence of files
+foreach $i ($vdjcFasta, $vdjcRef, @bamFiles, @firstMateFiles, @secondMateFiles)
+{
+	next if (length($i) == 0) ;
+	if ( !(-e $i))
+	{
+		die "Could not find file $i\n";
+	}
+}
+
+if (scalar(@bamFiles) == 0)
+{
+	foreach $i (@barcodeFiles)
+	{
+		next if (length($i) == 0) ;
+		if ( !(-e $i))
+		{
+			die "Could not find file $i\n";
+		}
+	}
+}
+
+# Infer the output prefix.
+if ( $prefix eq "" )
+{
+	# infer the output prefix.
+	if ( @bamFiles > 0 )
+	{
+		$prefix = "TRUST_".( split /\./, basename( $bamFiles[0] ) )[0] ;
+	}
+	elsif ( @firstMateFiles > 0 )
+	{
+		$prefix = "TRUST_".( split /\./, basename( $firstMateFiles[0] ) )[0] ;
+	}
+	elsif ( @singleFiles > 0 )
+	{
+		$prefix = "TRUST_".( split /\./, basename( $singleFiles[0] ) )[0] ;
+	}
+	else
+	{
+		$prefix = "TRUST" ;
+	}
+}
+
+if ( $outputDirectory ne "" )
+{
+	mkdir $outputDirectory if ( !-d $outputDirectory ) ;
+	$prefix = "$outputDirectory/$prefix" ;
+}
+
+$mainArgs .= " -o $prefix" ;
+
+if ($outputReadAssignment == 1)
+{
+	$annotatorArgs .= " --readAssignment ${prefix}_assign.out" ;
+}
+
+# Extract the file
+if ( $stage <= 0 )
+{
+	if ( @bamFiles > 0 )
+	{
+		system_call( "$WD/bam-extractor -b ".$bamFiles[0]." -t $threadCnt -f $vdjcFasta -o ${prefix}_toassemble $bamExtractorArgs" ) ;
+	}
+	elsif ( @firstMateFiles > 0 && $noExtraction == 0 )
+	{
+		my $fname ; 
+		foreach $fname (@firstMateFiles)
+		{
+			$fastqExtractorArgs .= " -1 ".$fname ;
+		}
+		foreach $fname (@secondMateFiles)
+		{
+			$fastqExtractorArgs .= " -2 ".$fname ;
+		}
+		foreach $fname (@barcodeFiles)
+		{
+			$fastqExtractorArgs .= " --barcode ".$fname ;
+		}
+		foreach $fname (@umiFiles)
+		{
+			$fastqExtractorArgs .= " --UMI ".$fname ;
+		}
+		system_call( "$WD/fastq-extractor -t $threadCnt -f $vdjcFasta -o ${prefix}_toassemble $fastqExtractorArgs" ) ;
+	}
+	elsif ( @singleFiles > 0 && $noExtraction == 0 )
+	{
+		my $fname ; 
+		foreach $fname (@singleFiles)
+		{
+			$fastqExtractorArgs .= " -u ".$fname ;
+		}
+		foreach $fname (@barcodeFiles)
+		{
+			$fastqExtractorArgs .= " --barcode ".$fname ;
+		}
+		foreach $fname (@umiFiles)
+		{
+			$fastqExtractorArgs .= " --UMI ".$fname ;
+		}
+		system_call( "$WD/fastq-extractor -t $threadCnt -f $vdjcFasta -o ${prefix}_toassemble $fastqExtractorArgs" ) ;
+	}
+}
+
+# determine paired-end or single-end
+if ( $noExtraction == 0 )
+{
+	if ( -e $prefix."_toassemble_1.fq" )
+	{
+#push @firstMateFiles, $prefix."_toassemble_1.fq" ;
+#push @secondMateFiles, $prefix."_toassemble_2.fq" ;
+		$mainArgs .= " -1 ".$prefix."_toassemble_1.fq -2 ".$prefix."_toassemble_2.fq" ;
+	}
+	elsif ( -e $prefix."_toassemble.fq" )
+	{
+#push @singleFiles, "${prefix}_toassemble.fq" ;
+		$mainArgs .= " -u ${prefix}_toassemble.fq" ;
+	}
+	elsif ( $stage <= 1 )
+	{
+		die "Could not find files like ${prefix}_toassemble*.fq\n" ;
+	}
+}
+else
+{
+	if ( @firstMateFiles > 0 )
+	{
+		$mainArgs .= " -1 ".$firstMateFiles[0]." -2 ".$secondMateFiles[0] ;		
+	}
+	elsif ( @singleFiles > 0 )
+	{
+		$mainArgs .= " -u ".$singleFiles[0] ;
+	}
+}
+
+if ( $hasBarcode == 1 )
+{
+	if ($noExtraction == 0)
+	{
+		$mainArgs .= " --barcode ${prefix}_toassemble_bc.fa" ;
+	}
+	else
+	{
+		$mainArgs .= " --barcode ".$barcodeFiles[0] ;
+	}
+}
+
+if ( $hasUmi == 1 )
+{
+	if ($noExtraction == 0)
+	{
+		$mainArgs .= " --UMI ${prefix}_toassemble_umi.fa" ;
+	}
+	else
+	{
+		$mainArgs .= " --UMI ".$umiFiles[0] ;
+	}
+}
+
+# Run the assembly 
+if ( $stage <= 1 )
+{
+	system_call( "$WD/trust4 $mainArgs" ) ;
+}
+
+# Annotation 
+if ( $stage <= 2 )
+{
+	if ( $hasBarcode == 0 || $hasUmi == 1 )
+	{
+		$annotatorArgs .= " -r ${prefix}_assembled_reads.fa" ;
+	}
+	else
+	{
+		$annotatorArgs .= " --outputCDR3File" ;
+	}
+	$annotatorArgs .= " --airrAlignment" ;
+
+	if ( $vdjcRef eq "" )
+	{
+		# Go through the -f file to check whether this could be from IMGT.
+		open FPtmp, $vdjcFasta ;
+		while (<FPtmp>)
+		{
+			next if ( /^>/) ;
+			if (/\./)
+			{
+				print STDERR "[".localtime()."] WARNING: $vdjcFasta is of IMGT format, automatically add --ref option.\n" ;
+				$vdjcRef = $vdjcFasta ;
+				last ;
+			}
+		}
+		close FPtmp ;
+	}
+
+	if ( $vdjcRef eq "" )
+	{
+		system_call( "$WD/annotator -f $vdjcFasta -a ${prefix}_final.out -t $threadCnt -o $prefix --notIMGT $annotatorArgs > ${prefix}_annot.fa" ) ;
+	}
+	else
+	{
+		system_call( "$WD/annotator -f $vdjcRef -a ${prefix}_final.out -t $threadCnt -o $prefix $annotatorArgs > ${prefix}_annot.fa" ) ;
+	}
+}
+
+# Generate the report table
+if ( $stage <= 3 )
+{
+	if ($hasBarcode == 0)
+	{
+		system_call( "perl $WD/trust-simplerep.pl ${prefix}_cdr3.out $simpleRepArgs > ${prefix}_report.tsv" ) ;
+		system_call( "perl $WD/trust-airr.pl ${prefix}_report.tsv ${prefix}_annot.fa --airr-align ${prefix}_airr_align.tsv > ${prefix}_airr.tsv" ) ;
+	}
+	else #if ( $hasBarcode == 1 )
+	{
+		system_call( "perl $WD/trust-barcoderep.pl ${prefix}_cdr3.out -a ${prefix}_annot.fa --chainsInBarcode $chainsInBarcode > ${prefix}_barcode_report.tsv" ) ;
+		system_call( "perl $WD/trust-simplerep.pl ${prefix}_cdr3.out $simpleRepArgs --filterBarcoderep ${prefix}_barcode_report.tsv > ${prefix}_report.tsv" ) ;
+		system_call( "perl $WD/trust-airr.pl ${prefix}_report.tsv ${prefix}_annot.fa --airr-align ${prefix}_airr_align.tsv > ${prefix}_airr.tsv" ) ;
+		system_call( "perl $WD/trust-airr.pl ${prefix}_barcode_report.tsv ${prefix}_annot.fa --format barcoderep --airr-align ${prefix}_airr_align.tsv > ${prefix}_barcode_airr.tsv" ) ;
+	}
+}
+
+print STDERR "[".localtime()."] TRUST4 finishes.\n" ;
+# Filter and output.
